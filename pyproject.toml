@@ -14,11 +14,11 @@ readme = "README.md"
 keywords = ["your", "project", "keywords"]
 
 dependencies = [
-    "ipython",
     "matplotlib",
     "tqdm",
     "jax[cuda12]",
     "equinox",
+    "gymnasium", # just for testing
 ]
 
 [tool.setuptools.packages.find]
