@@ -53,7 +53,6 @@ def replay(num_envs, horizon, obs_size, act_size):
 
     return init, store, sample_batch
 
-# Define the functional replay buffer for episode statistics
 def episode_statistics(num_envs):
     # Initialize the buffer
     def init():
@@ -83,6 +82,62 @@ def episode_statistics(num_envs):
         return buffer
 
     return init, update
+
+def running_mean_std():
+
+    # Initialize the running mean and std
+    def init(mean=None, var=None, epsilon=1e-4, shape=()):
+        if mean is None:
+            mean = jnp.zeros(shape)
+        if var is None:
+            var = jnp.ones(shape)
+        count = epsilon
+        rms = {
+            'mean': mean,
+            'var': var,
+            'count': count
+        }
+        return rms
+
+    # Update the running mean and std with a new batch of data
+    def update(rms, arr):
+        arr = jax.lax.stop_gradient(arr)
+        batch_mean = jnp.mean(arr, axis=0)
+        batch_var = jnp.var(arr, axis=0)
+        batch_count = arr.shape[0]
+
+        # Update from batch moments
+        def update_from_moments(rms, batch_mean, batch_var, batch_count):
+            delta = batch_mean - rms['mean']
+            tot_count = rms['count'] + batch_count
+            new_mean = rms['mean'] + delta * batch_count / tot_count
+            m_a = rms['var'] * rms['count']
+            m_b = batch_var * batch_count
+            m_2 = (
+                m_a
+                + m_b
+                + delta ** 2 * rms['count'] * batch_count / tot_count
+            )
+            new_var = m_2 / tot_count
+            new_count = tot_count
+            new_rms = {
+                'mean': new_mean,
+                'var': new_var,
+                'count': new_count
+            }
+            return new_rms
+
+        return update_from_moments(rms, batch_mean, batch_var, batch_count)
+
+    # Normalize an array using the running mean and std
+    def normalize(rms, arr):
+        return (arr - rms['mean']) / jnp.sqrt(rms['var'] + 1e-5)
+
+    # Denormalize an array using the running mean and std
+    def denormalize(rms, arr):
+        return arr * jnp.sqrt(rms['var'] + 1e-5) + rms['mean']
+
+    return init, update, normalize, denormalize
 
 if __name__ == "__main__":
 
