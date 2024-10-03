@@ -4,8 +4,21 @@ import jax.random as jr
 import equinox as eqx
 import dataclasses
 
+from typing import Any, Mapping, NamedTuple, Tuple, TypeVar
+
 from typing import Dict, Any, Tuple
 
+
+class Transition(NamedTuple):
+    observation: jnp.array
+    action: jnp.array
+    reward: jnp.array
+    discount: jnp.array
+    next_observation: jnp.array
+    extras: Dict
+
+
+# equinox modules cast the dataclass to a pytree - we can use dataclasses.replace on it
 class RunningMeanStd(eqx.Module):
     mean: jnp.ndarray
     var: jnp.ndarray
@@ -48,25 +61,6 @@ class RunningMeanStd(eqx.Module):
     def denormalize(self, arr):
         return arr * jnp.sqrt(self.var + 1e-5) + self.mean
 
-# the brax PPO doesnt use a running buffer, samples on-policy the whole time with rollouts
-class ReplayBuffer(eqx.Module):
-    data: Dict[str, jax.Array] = {}
-
-    @property
-    def size(self):
-        # WARN: do not use __len__ here! It will use len of the dataclass, i.e. number of fields.
-        return self.data["obs"].shape[0]
-
-    def update(self):
-        return dataclasses.replace(
-            self,
-            data=None
-        )
-    
-    def sample_batch(self, key: jr.PRNGKey, batch_size: int) -> Dict[str, jax.Array]:
-        indices = jax.random.randint(key, shape=(batch_size,), minval=0, maxval=self.size)
-        batch = jax.tree_map(lambda arr: arr[indices], self.data)
-        return batch
 
 if __name__ == "__main__":
     # Set random seed for reproducibility

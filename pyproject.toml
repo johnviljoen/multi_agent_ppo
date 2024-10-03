@@ -18,7 +18,6 @@ dependencies = [
     "tqdm",
     "jax[cuda12]",
     "equinox",
-    "distrax",
     "brax",
     "IPython"
 ]

@@ -1,200 +1,92 @@
-# Copyright 2024 The Brax Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#         http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""Proximal policy optimization training.
-
-See: https://arxiv.org/pdf/1707.06347.pdf
-"""
-
 import functools
-import time
 from typing import Callable, Optional, Tuple, Union
 
-from absl import logging
-from brax import base
-from brax import envs
-from brax.training import acting
-from brax.training import gradients
-from brax.training import pmap
-from brax.training import types
-
-import running_statistics
-
-from brax.training.acme import specs
+from data_structures import ReplayBuffer, RunningMeanStd, Transition
 
 import losses as ppo_losses
-import networks as ppo_networks
+import models as ppo_networks
 
-from brax.training.types import Params
-from brax.training.types import PRNGKey
-from brax.v1 import envs as envs_v1
-from etils import epath
-import flax
+import numpy as np
 import jax
 import jax.numpy as jnp
-import numpy as np
+from brax.v1 import envs as envs_v1
+import jax.random as jr
+
 import optax
-from orbax import checkpoint as ocp
+
+from brax import envs
+from time import time
+from dataclasses import dataclass
+from absl import logging
+
+from models import PPOStochasticActor, ValueNetwork
+
+@dataclass
+class Config:
+    env: envs.Env
+    num_timesteps: int
+    episode_length: int
+    action_repeat: int = 1
+    num_envs: int = 1
+    max_devices_per_host: Optional[int] = None
+    num_eval_envs: int = 128
+    learning_rate: float = 1e-4
+    entropy_cost: float = 1e-4
+    discounting: float = 0.9
+    seed: int = 0
+    unroll_length: int = 10
+    batch_size: int = 32
+    num_minibatches: int = 16
+    num_updates_per_batch: int = 2
+    num_evals: int = 1
+    num_resets_per_eval: int = 0
+    normalize_observations: bool = False
+    reward_scaling: float = 1.0
+    clipping_epsilon: float = 0.3
+    gae_lambda: float = 0.95
+    deterministic_eval: bool = False
+    progress_fn: Callable = lambda *args: None
+    normalize_advantage: bool = True
+    eval_env: Optional[envs.Env] = None
+    policy_params_fn: Callable[..., None] = lambda *args: None
+    randomization_fn = None
+    restore_checkpoint_path: Optional[str] = None
 
 
-InferenceParams = Tuple[running_statistics.NestedMeanStd, Params]
-Metrics = types.Metrics
+def train(c): # c is the config
 
-_PMAP_AXIS_NAME = 'i'
-
-
-@flax.struct.dataclass
-class TrainingState:
-    """Contains training state for the learner."""
-    optimizer_state: optax.OptState
-    params: ppo_losses.PPONetworkParams
-    normalizer_params: running_statistics.RunningStatisticsState
-    env_steps: jnp.ndarray
-
-
-def _unpmap(v):
-    return jax.tree_util.tree_map(lambda x: x[0], v)
-
-
-def _strip_weak_type(tree):
-    # brax user code is sometimes ambiguous about weak_type.    in order to
-    # avoid extra jit recompilations we strip all weak types from user input
-    def f(leaf):
-        leaf = jnp.asarray(leaf)
-        return leaf.astype(leaf.dtype)
-    return jax.tree_util.tree_map(f, tree)
-
-
-def train(
-        environment: Union[envs_v1.Env, envs.Env],
-        num_timesteps: int,
-        episode_length: int,
-        action_repeat: int = 1,
-        num_envs: int = 1,
-        max_devices_per_host: Optional[int] = None,
-        num_eval_envs: int = 128,
-        learning_rate: float = 1e-4,
-        entropy_cost: float = 1e-4,
-        discounting: float = 0.9,
-        seed: int = 0,
-        unroll_length: int = 10,
-        batch_size: int = 32,
-        num_minibatches: int = 16,
-        num_updates_per_batch: int = 2,
-        num_evals: int = 1,
-        num_resets_per_eval: int = 0,
-        normalize_observations: bool = False,
-        reward_scaling: float = 1.0,
-        clipping_epsilon: float = 0.3,
-        gae_lambda: float = 0.95,
-        deterministic_eval: bool = False,
-        network_factory: types.NetworkFactory[
-                ppo_networks.PPONetworks
-        ] = ppo_networks.make_ppo_networks,
-        progress_fn: Callable[[int, Metrics], None] = lambda *args: None,
-        normalize_advantage: bool = True,
-        eval_env: Optional[envs.Env] = None,
-        policy_params_fn: Callable[..., None] = lambda *args: None,
-        randomization_fn: Optional[
-                Callable[[base.System, jnp.ndarray], Tuple[base.System, base.System]]
-        ] = None,
-        restore_checkpoint_path: Optional[str] = None,
-):
-    """PPO training.
-
-    Args:
-        environment: the environment to train
-        num_timesteps: the total number of environment steps to use during training
-        episode_length: the length of an environment episode
-        action_repeat: the number of timesteps to repeat an action
-        num_envs: the number of parallel environments to use for rollouts
-            NOTE: `num_envs` must be divisible by the total number of chips since each
-                chip gets `num_envs // total_number_of_chips` environments to roll out
-            NOTE: `batch_size * num_minibatches` must be divisible by `num_envs` since
-                data generated by `num_envs` parallel envs gets used for gradient
-                updates over `num_minibatches` of data, where each minibatch has a
-                leading dimension of `batch_size`
-        max_devices_per_host: maximum number of chips to use per host process
-        num_eval_envs: the number of envs to use for evluation. Each env will run 1
-            episode, and all envs run in parallel during eval.
-        learning_rate: learning rate for ppo loss
-        entropy_cost: entropy reward for ppo loss, higher values increase entropy of
-            the policy
-        discounting: discounting rate
-        seed: random seed
-        unroll_length: the number of timesteps to unroll in each environment. The
-            PPO loss is computed over `unroll_length` timesteps
-        batch_size: the batch size for each minibatch SGD step
-        num_minibatches: the number of times to run the SGD step, each with a
-            different minibatch with leading dimension of `batch_size`
-        num_updates_per_batch: the number of times to run the gradient update over
-            all minibatches before doing a new environment rollout
-        num_evals: the number of evals to run during the entire training run.
-            Increasing the number of evals increases total training time
-        num_resets_per_eval: the number of environment resets to run between each
-            eval. The environment resets occur on the host
-        normalize_observations: whether to normalize observations
-        reward_scaling: float scaling for reward
-        clipping_epsilon: clipping epsilon for PPO loss
-        gae_lambda: General advantage estimation lambda
-        deterministic_eval: whether to run the eval with a deterministic policy
-        network_factory: function that generates networks for policy and value
-            functions
-        progress_fn: a user-defined callback function for reporting/plotting metrics
-        normalize_advantage: whether to normalize advantage estimate
-        eval_env: an optional environment for eval only, defaults to `environment`
-        policy_params_fn: a user-defined callback function that can be used for
-            saving policy checkpoints
-        randomization_fn: a user-defined callback function that generates randomized
-            environments
-        restore_checkpoint_path: the path used to restore previous model params
-
-    Returns:
-        Tuple of (make_policy function, network params, metrics)
-    """
-    assert batch_size * num_minibatches % num_envs == 0
+    assert c.batch_size * c.num_minibatches % c.num_envs == 0
     xt = time.time()
 
     process_count = jax.process_count()
     process_id = jax.process_index()
     local_device_count = jax.local_device_count()
     local_devices_to_use = local_device_count
-    if max_devices_per_host:
-        local_devices_to_use = min(local_devices_to_use, max_devices_per_host)
+    if c.max_devices_per_host:
+        local_devices_to_use = min(local_devices_to_use, c.max_devices_per_host)
     logging.info(
-            'Device count: %d, process count: %d (id %d), local device count: %d, '
-            'devices to be used count: %d', jax.device_count(), process_count,
-            process_id, local_device_count, local_devices_to_use)
+        'Device count: %d, process count: %d (id %d), local device count: %d, '
+        'devices to be used count: %d', jax.device_count(), process_count,
+        process_id, local_device_count, local_devices_to_use)
     device_count = local_devices_to_use * process_count
 
+
     # The number of environment steps executed for every training step.
-    env_step_per_training_step = (
-            batch_size * unroll_length * num_minibatches * action_repeat)
-    num_evals_after_init = max(num_evals - 1, 1)
+    env_step_per_training_step = (c.batch_size * c.unroll_length * c.num_minibatches * c.action_repeat)
+    num_evals_after_init = max(c.num_evals - 1, 1)
     # The number of training_step calls per training_epoch call.
     # equals to ceil(num_timesteps / (num_evals * env_step_per_training_step *
-    #                                                                 num_resets_per_eval))
+    #                                 num_resets_per_eval))
     num_training_steps_per_epoch = np.ceil(
-            num_timesteps
-            / (
-                    num_evals_after_init
-                    * env_step_per_training_step
-                    * max(num_resets_per_eval, 1)
-            )
+        c.num_timesteps
+        / (
+            num_evals_after_init
+            * env_step_per_training_step
+            * max(c.num_resets_per_eval, 1)
+        )
     ).astype(int)
 
-    key = jax.random.PRNGKey(seed)
+    key = jax.random.PRNGKey(c.seed)
     global_key, local_key = jax.random.split(key)
     del key
     local_key = jax.random.fold_in(local_key, process_id)
@@ -204,62 +96,59 @@ def train(
     key_policy, key_value = jax.random.split(global_key)
     del global_key
 
-    assert num_envs % device_count == 0
+    assert c.num_envs % device_count == 0
 
     v_randomization_fn = None
-    if randomization_fn is not None:
-        randomization_batch_size = num_envs // local_device_count
+    if c.randomization_fn is not None:
+        randomization_batch_size = c.num_envs // local_device_count
         # all devices gets the same randomization rng
         randomization_rng = jax.random.split(key_env, randomization_batch_size)
         v_randomization_fn = functools.partial(
-                randomization_fn, rng=randomization_rng
+            c.randomization_fn, rng=randomization_rng
         )
 
-    if isinstance(environment, envs.Env):
+    if isinstance(c.environment, envs.Env):
         wrap_for_training = envs.training.wrap
     else:
         wrap_for_training = envs_v1.wrappers.wrap_for_training
 
     env = wrap_for_training(
-            environment,
-            episode_length=episode_length,
-            action_repeat=action_repeat,
-            randomization_fn=v_randomization_fn,
+        c.environment,
+        episode_length=c.episode_length,
+        action_repeat=c.action_repeat,
+        randomization_fn=v_randomization_fn,
     )
 
     reset_fn = jax.jit(jax.vmap(env.reset))
-    key_envs = jax.random.split(key_env, num_envs // process_count)
-    key_envs = jnp.reshape(key_envs,
-                                                 (local_devices_to_use, -1) + key_envs.shape[1:])
+    key_envs = jax.random.split(key_env, c.num_envs // process_count)
+    key_envs = jnp.reshape(key_envs, (local_devices_to_use, -1) + key_envs.shape[1:])
     env_state = reset_fn(key_envs)
 
     normalize = lambda x, y: x
-    if normalize_observations:
-        normalize = running_statistics.normalize
-    ppo_network = network_factory(
-            env_state.obs.shape[-1],
-            env.action_size,
-            preprocess_observations_fn=normalize)
-    make_policy = ppo_networks.make_inference_fn(ppo_network)
 
-    optimizer = optax.adam(learning_rate=learning_rate)
+    actor_network = PPOStochasticActor([])
+    value_network = ValueNetwork([])
+
+    optimizer = optax.adam(learning_rate=c.learning_rate)
 
     loss_fn = functools.partial(
             ppo_losses.compute_ppo_loss,
-            ppo_network=ppo_network,
-            entropy_cost=entropy_cost,
-            discounting=discounting,
-            reward_scaling=reward_scaling,
-            gae_lambda=gae_lambda,
-            clipping_epsilon=clipping_epsilon,
-            normalize_advantage=normalize_advantage)
+            actor_network=actor_network,
+            value_network=value_network,
+            rms = RMS,
+            entropy_cost=c.entropy_cost,
+            discounting=c.discounting,
+            reward_scaling=c.reward_scaling,
+            gae_lambda=c.gae_lambda,
+            clipping_epsilon=c.clipping_epsilon,
+            normalize_advantage=c.normalize_advantage)
 
     gradient_update_fn = gradients.gradient_update_fn(
             loss_fn, optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True)
 
     def minibatch_step(
-            carry, data: types.Transition,
-            normalizer_params: running_statistics.RunningStatisticsState):
+            carry, data: Transition,
+            normalizer_params: RunningMeanStd):
         optimizer_state, params, key = carry
         key, key_loss = jax.random.split(key)
         (_, metrics), params, optimizer_state = gradient_update_fn(
@@ -271,14 +160,14 @@ def train(
 
         return (optimizer_state, params, key), metrics
 
-    def sgd_step(carry, unused_t, data: types.Transition,
-                             normalizer_params: running_statistics.RunningStatisticsState):
+    def sgd_step(carry, unused_t, data: Transition,
+                             normalizer_params: RunningMeanStd):
         optimizer_state, params, key = carry
         key, key_perm, key_grad = jax.random.split(key, 3)
 
         def convert_data(x: jnp.ndarray):
             x = jax.random.permutation(key_perm, x)
-            x = jnp.reshape(x, (num_minibatches, -1) + x.shape[1:])
+            x = jnp.reshape(x, (c.num_minibatches, -1) + x.shape[1:])
             return x
 
         shuffled_data = jax.tree_util.tree_map(convert_data, data)
@@ -286,11 +175,11 @@ def train(
                 functools.partial(minibatch_step, normalizer_params=normalizer_params),
                 (optimizer_state, params, key_grad),
                 shuffled_data,
-                length=num_minibatches)
+                length=c.num_minibatches)
         return (optimizer_state, params, key), metrics
 
     def training_step(
-            carry: Tuple[TrainingState, envs.State, PRNGKey],
+            carry: Tuple[TrainingState, envs.State, jr.PRNGKey],
             unused_t) -> Tuple[Tuple[TrainingState, envs.State, PRNGKey], Metrics]:
         training_state, state, key = carry
         key_sgd, key_generate_unroll, new_key = jax.random.split(key, 3)
@@ -351,7 +240,7 @@ def train(
     # Note that this is NOT a pure jittable method.
     def training_epoch_with_timing(
             training_state: TrainingState, env_state: envs.State,
-            key: PRNGKey) -> Tuple[TrainingState, envs.State, Metrics]:
+            key: jr.PRNGKey) -> Tuple[TrainingState, envs.State, Metrics]:
         nonlocal training_walltime
         t = time.time()
         training_state, env_state = _strip_weak_type((training_state, env_state))
@@ -487,3 +376,27 @@ def train(
     logging.info('total steps: %s', total_steps)
     pmap.synchronize_hosts()
     return (make_policy, params, metrics)
+
+if __name__ == "__main__":
+
+    # provided good hyperparameters for the ant environment
+    config = Config(
+        env="ant", 
+        num_timesteps=50_000_000,
+        num_evals=10, 
+        reward_scaling=10, 
+        episode_length=1000, 
+        normalize_observations=True, 
+        action_repeat=1, 
+        unroll_length=5, 
+        num_minibatches=32, 
+        num_updates_per_batch=4, 
+        discounting=0.97, 
+        learning_rate=3e-4, 
+        entropy_cost=1e-2, 
+        num_envs=4096, 
+        batch_size=2048, 
+        seed=1
+    )
+
+    train(config)

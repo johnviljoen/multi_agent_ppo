@@ -2,8 +2,8 @@ import jax
 import jax.numpy as jnp
 
 from models import PPOStochasticActor, ValueNetwork
-from data_structures import RunningMeanStd
-from data_structures import ReplayBuffer
+from data_structures import RunningMeanStd, Transition
+# from data_structures import ReplayBuffer
 
 def compute_gae(truncation: jnp.ndarray,
                 termination: jnp.ndarray,
@@ -43,7 +43,7 @@ def compute_gae(truncation: jnp.ndarray,
     deltas *= truncation_mask
 
     # Recursive Advantage calculation
-    # A_t = delta_t + gamma * lambda * (1-d_t) *A_{t+1}
+    # A_t = delta_t + gamma * lambda * (1-d_t) * A_{t+1}
     # when lambda = 1 all future steps are fully considered, when lambda = 0 only 1 step TD error is considered
     # acc is the accumulated advantage
     acc = jnp.zeros_like(bootstrap_value)
@@ -69,11 +69,11 @@ def compute_gae(truncation: jnp.ndarray,
 
 
 def compute_ppo_loss(
-        policy: PPOStochasticActor, # Policy network (Equinox module)
-        value: ValueNetwork,        # Value network (Equinox module)
-        rms: RunningMeanStd,        # Running mean std parameters
-        data: ReplayBuffer,      # Transition data
-        rng: jnp.Array,
+        actor_network: PPOStochasticActor, # Policy network (Equinox module)
+        value_network: ValueNetwork,        # Value network (Equinox module)
+        observation_rms: RunningMeanStd,        # Running mean std parameters
+        data,      # Transition data
+        rng: jnp.array,
         entropy_cost: float = 1e-4,
         discounting: float = 0.99,
         reward_scaling: float = 1.0,
@@ -86,8 +86,8 @@ def compute_ppo_loss(
     data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
 
     # Calculate the estimated advantages and values
-    baseline = value(data.observation, rms=rms)
-    bootstrap_value = value(data.next_observation[-1], rms=rms)
+    baseline = value_network(data.observation, normalize=observation_rms.normalize)
+    bootstrap_value = value_network(data.next_observation[-1], normalize=observation_rms.normalize)
     rewards = data.reward * reward_scaling
     truncation = data.trunctation
     termination = (1 - data.discount) * (1 - truncation)
@@ -106,8 +106,8 @@ def compute_ppo_loss(
 
     # Calculate the Policy Ratio rho_s
     # rho_s = policy(a_t|s_t) / policy_old(a_t|s_t) = exp(log policy(a_t|s_t) - log policy_old(a_t|s_t))
-    policy_logits = policy(data.observation, rms=rms)
-    target_action_log_probs = policy.log_prob(policy_logits, data.raw_action)
+    policy_logits = actor_network(data.observation, rms=observation_rms)
+    target_action_log_probs = actor_network.log_prob(policy_logits, data.raw_action)
     behaviour_action_log_probs = data.log_prob
     rho_s = jnp.exp(target_action_log_probs - behaviour_action_log_probs)
 
@@ -143,5 +143,121 @@ def compute_ppo_loss(
 
 if __name__ == "__main__": 
 
-    pass
+    seed = 0
 
+    import jax.random as jr
+    from brax import envs
+
+    def unit_test_gae_loss(seed):
+
+        rng = jr.PRNGKey(seed); _rng, rng = jr.split(rng)
+
+        truncation = jnp.array([
+            [0,0],
+            [0,0],
+            [1,0],
+            [0,0],
+            [0,1],
+        ])
+
+        termination = jnp.array([
+            [0,1],
+            [0,0],
+            [0,0],
+            [0,0],
+            [0,0],
+        ])
+
+        rewards = jr.normal(_rng, [5,2]); _rng, rng = jr.split(rng)
+        values = jr.normal(_rng, [5,2]); _rng, rng = jr.split(rng)
+        bootstrap_value = jr.normal(_rng, [2]); _rng, rng = jr.split(rng)
+
+        gae_lambda = 1.0
+        gae_discount = 0.99
+
+        test_vs, test_advantages = compute_gae(truncation, termination, rewards, values, bootstrap_value, lambda_=gae_lambda, discount=gae_discount)
+
+        truncation_mask = 1 - truncation
+
+        # TD residuals:
+        # delta_t = r_t + gamma * (1-d_t) * V(s_{t+1}) - V(s_t)
+        # Append bootstrapped value to get [v1, ..., v_t+1]
+        values_t_plus_1 = jnp.concatenate([values[1:], jnp.expand_dims(bootstrap_value, 0)], axis=0)
+        deltas = rewards + gae_discount * (1 - termination) * values_t_plus_1 - values
+        deltas *= truncation_mask
+
+        # Initialization
+        acc = jnp.zeros_like(bootstrap_value)
+        vs_minus_v_xs = []
+
+        # Reverse loop for GAE accumulation
+        for t in reversed(range(truncation_mask.shape[0])):
+            delta = deltas[t]
+            trunc_mask = truncation_mask[t]
+            term = termination[t]
+            # Accumulate advantage
+            acc = delta + gae_discount * (1 - term) * trunc_mask * gae_lambda * acc
+            # Store the accumulated value
+            vs_minus_v_xs.insert(0, acc)  # Insert at the front to reverse the order since we are iterating in reverse
+        vs_minus_v_xs = jnp.stack(vs_minus_v_xs)
+
+        # Final Values and Advantages
+        # advantage = (rewards + gamma * (1-termination) * V(s_{t+1})) - V(s_t)
+        # Add V(x_s) to get v_s.
+        vs = jnp.add(vs_minus_v_xs, values)
+        vs_t_plus_1 = jnp.concatenate([vs[1:], jnp.expand_dims(bootstrap_value, 0)], axis=0)
+        advantages = (rewards + gae_discount * (1 - termination) * vs_t_plus_1 - values) * truncation_mask
+
+    # unit_test_gae_loss(seed)
+
+    def unit_test_ppo_loss(seed):
+
+        rng = jr.PRNGKey(seed); _rng, rng = jr.split(rng)
+    
+        # need some arbitrary data
+        num_envs = 3
+        unroll_length = 5
+
+        env = envs.get_environment(env_name="reacher", backend="positional")
+        env_state = jax.vmap(env.reset)(jr.split(_rng, [num_envs]));  _rng, rng = jr.split(rng)
+
+        actor_network = PPOStochasticActor(
+            [env.observation_size, 32, 32, 32, env.action_size],
+            mlp_key = _rng
+        )
+
+        value_network = ValueNetwork(
+            [env.observation_size, 32, 32, 32, 1],
+            key = _rng
+        )
+
+        data = []
+        for i in range(unroll_length):
+            action = jax.vmap(actor_network)(env_state.obs)
+            nstate = jax.vmap(env.step)(env_state, action)
+
+            data = Transition(
+                observation=env_state.obs,
+                action=action,
+                reward=nstate.reward,
+                discount=1 - nstate.done,
+                next_observation=nstate.obs,
+                extras = {
+                    'policy_extras': None,
+                    'state_extras': None
+                }
+            )
+
+        def f(carry, unused_t):
+
+            observation = jax.vmap(env._get_obs)(env_state.pipeline_state) # a single snapshot across all environments
+            action = jax.vmap(actor_network)(observation)
+            env_state = jax.vmap(env.step)(env_state, action)
+            reward = env_state.reward
+            next_observation = jax.vmap(env._get_obs)(env_state.pipeline_state)
+
+            actor_network()
+
+        print('fin')
+
+    unit_test_ppo_loss(seed)
