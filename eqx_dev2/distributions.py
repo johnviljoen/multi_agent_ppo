@@ -36,11 +36,11 @@ class NormalTanhDistribution:
         scale = (jax.nn.softplus(scale) + self._min_std) * self._var_scale
         return NormalDistribution(loc=loc, scale=scale)
     
-    def sample_no_postprocess(self, loc, scale, key):
+    def sample_no_postprocess(self, key, loc, scale):
         return self.create_dist(loc, scale).sample(key=key)
     
-    def sample(self, loc, scale, key):
-        return jnp.tanh(self.sample_no_postprocess(loc, scale, key))
+    def sample(self, key, loc, scale):
+        return jnp.tanh(self.sample_no_postprocess(key, loc, scale))
 
     def mode(self, loc, scale):
         return jnp.tanh(self.create_dist(loc, scale).mode())
@@ -57,7 +57,7 @@ class NormalTanhDistribution:
         log_probs = jnp.sum(log_probs, axis=-1)  # sum over action dimension
         return log_probs
     
-    def entropy(self, loc, scale, key):
+    def entropy(self, key, loc, scale):
         """Return the entropy of the given distribution."""
         dist = self.create_dist(loc, scale)
         entropy = dist.entropy()
@@ -119,7 +119,7 @@ if __name__ == "__main__":
     # Generate samples from the NormalTanhDistribution
     key, subkey = jax.random.split(key)
     subkey = jax.random.split(subkey, sample_shape)
-    samples_normal_tanh = jax.vmap(normal_tanh_dist.sample)(loc_tanh, scale_tanh, subkey)
+    samples_normal_tanh = jax.vmap(normal_tanh_dist.sample)(subkey, loc_tanh, scale_tanh)
 
     # Convert samples to NumPy array for plotting
     samples_normal_tanh_np = np.array(samples_normal_tanh).flatten()
@@ -139,7 +139,7 @@ if __name__ == "__main__":
     # Generate samples from the underlying normal distribution
     key, subkey = jax.random.split(key)
     subkey = jax.random.split(subkey, sample_shape)
-    samples_underlying = jax.vmap(normal_tanh_dist.sample_no_postprocess)(loc_tanh, scale_tanh, subkey)
+    samples_underlying = jax.vmap(normal_tanh_dist.sample_no_postprocess)(subkey, loc_tanh, scale_tanh)
     samples_underlying_np = np.array(samples_underlying).flatten()
 
     # Apply tanh manually to the samples
@@ -156,21 +156,32 @@ if __name__ == "__main__":
     plt.savefig("test3.png", dpi=500)
     plt.close()
 
-    # Plot the effect of tanh on the PDF 
-    # NOTE the analytical line here is approximate - the real sampled dist is correct.
-    x_underlying = np.linspace(-5, 5, num_samples)
+    epsilon = 1e-6  # Small value to avoid division by zero at y = ±1
+
+    # Generate x values for the underlying normal distribution with extended range for tails
+    x_underlying = np.linspace(-1000, 1000, num_samples)
+
+    # Compute the PDF of the normal distribution
     pdf_underlying = norm.pdf(x_underlying, loc=loc_tanh, scale=scale_tanh)
+
+    # Apply the tanh transformation
     x_tanh = np.tanh(x_underlying)
-    # Compute the transformed PDF using change of variables
-    pdf_tanh = pdf_underlying / (1 - x_tanh**2)
-    # Since x_tanh is not monotonically increasing over the full range, we need to sort it for plotting
+
+    # Compute the transformed PDF using the correct formula
+    pdf_tanh = pdf_underlying / (1 - x_tanh**2 + epsilon)  # Add epsilon to avoid division by zero
+
+    # Sort for proper plotting
     sorted_indices = np.argsort(x_tanh)
     x_tanh_sorted = x_tanh[sorted_indices]
     pdf_tanh_sorted = pdf_tanh[sorted_indices]
 
+    # Plotting
     plt.figure(figsize=(10, 6))
     plt.plot(x_tanh_sorted, pdf_tanh_sorted, 'b', lw=2, label='Transformed PDF')
+
+    # Plot the histogram of empirical samples
     plt.hist(samples_normal_tanh_np, bins=100, density=True, alpha=0.6, color='lightgreen', label='Sampled Histogram')
+
     plt.title('Transformed PDF vs Sampled Histogram')
     plt.xlabel('x')
     plt.ylabel('Density')

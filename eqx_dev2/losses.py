@@ -129,7 +129,7 @@ def compute_ppo_loss(
 
     # Entropy reward
     # entropy = - Sum_a policy(a|s) log policy(a|s) * entropy_cost
-    entropy = jnp.mean(policy.entropy(policy_logits, rng))
+    entropy = jnp.mean(actor_network.entropy(policy_logits, rng))
     entropy_loss = entropy_cost * -entropy
 
     # Total loss = policy loss + value loss + entropy loss
@@ -221,32 +221,30 @@ if __name__ == "__main__":
         env = envs.get_environment(env_name="reacher", backend="positional")
         env_state = jax.vmap(env.reset)(jr.split(_rng, [num_envs]));  _rng, rng = jr.split(rng)
 
-        actor_network = PPOStochasticActor(
-            [env.observation_size, 32, 32, 32, env.action_size],
-            mlp_key = _rng
-        )
+        actor_network = PPOStochasticActor(_rng, [env.observation_size, 32, 32, 32, env.action_size]);  _rng, rng = jr.split(rng)
 
-        value_network = ValueNetwork(
-            [env.observation_size, 32, 32, 32, 1],
-            key = _rng
-        )
+        value_network = ValueNetwork(_rng, [env.observation_size, 32, 32, 32, 1]);  _rng, rng = jr.split(rng)
 
         data = []
         for i in range(unroll_length):
-            action = jax.vmap(actor_network)(env_state.obs)
+
+            action, raw_action = jax.vmap(actor_network)(jr.split(_rng, num=num_envs), env_state.obs); _rng, rng = jr.split(rng)
             nstate = jax.vmap(env.step)(env_state, action)
 
-            data = Transition(
-                observation=env_state.obs,
-                action=action,
-                reward=nstate.reward,
-                discount=1 - nstate.done,
-                next_observation=nstate.obs,
-                extras = {
-                    'policy_extras': None,
-                    'state_extras': None
-                }
+            data.append(
+                Transition(
+                    observation=env_state.obs,
+                    action=action,
+                    reward=nstate.reward,
+                    discount=1 - nstate.done,
+                    next_observation=nstate.obs,
+                    extras = {
+                        'policy_extras': {'raw_action': raw_action},
+                        'state_extras': {}
+                    }
+                )
             )
+
 
         def f(carry, unused_t):
 

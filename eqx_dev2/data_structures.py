@@ -6,7 +6,7 @@ import dataclasses
 
 from typing import Any, Mapping, NamedTuple, Tuple, TypeVar
 
-from typing import Dict, Any, Tuple
+from typing import Dict
 
 
 class Transition(NamedTuple):
