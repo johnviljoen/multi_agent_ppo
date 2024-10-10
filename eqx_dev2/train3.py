@@ -15,6 +15,7 @@ from running_mean_std import RunningMeanStd
 from losses import compute_ppo_loss
 from plotting import rollout_and_render
 from rollout import generate_rollout_v
+from eqx_ops import filter_scan
 
 class AgentModel(eqx.Module):
     actor_network: PPOStochasticActor
@@ -80,7 +81,7 @@ def train(
             loss, metrics = compute_ppo_loss(
                 actor_network=model.actor_network,
                 value_network=model.value_network,
-                observation_rms=training_state.observation_rms,
+                observation_rms=training_state.obs_rms,
                 data=minibatch_data,
                 rng=key_loss,
                 entropy_cost=entropy_cost,
@@ -93,13 +94,13 @@ def train(
             return loss, metrics
         
         (loss, metrics), grads = eqx.filter_value_and_grad(loss_fn, has_aux=True)(training_state.model)
-        updates, new_optimizer_state = opt.update(
+        updates, new_opt_state = opt.update(
             grads, training_state.opt_state, training_state.model
         )
         new_model = eqx.apply_updates(training_state.model, updates)
         new_training_state = dataclasses.replace(
             training_state,
-            optimizer_state=new_optimizer_state,
+            opt_state=new_opt_state,
             model=new_model,
             env_steps=training_state.env_steps + unroll_length * num_envs
         )
@@ -108,15 +109,17 @@ def train(
     
     def sgd_step(carry, _, data):
         training_state, key = carry
-        key_perm, key_grad, new_key = jr.split(key)
+        key_perm, key_grad, new_key = jr.split(key, 3)
 
         def convert_data(x: jnp.ndarray):
             x = jax.random.permutation(key_perm, x)
+            # x = jnp.transpose(x, (1,0,2)) # swap time and env dimensions
             x = jnp.reshape(x, (num_minibatches, -1) + x.shape[1:])
+            # x = jnp.transpose(x, (0,2,1,3)) # swap time and env dimensions
             return x
         
         shuffled_data = jax.tree_util.tree_map(convert_data, data)
-        (new_training_state, _), metrics = jax.lax.scan(
+        (new_training_state, _), metrics = filter_scan(
                 minibatch_step,
                 (training_state, key_grad),
                 shuffled_data,
@@ -127,23 +130,38 @@ def train(
         training_state, env_state, key = carry
         key_sgd, key_generate_unroll, new_key = jax.random.split(key, 3)
 
-        data, env_state = generate_unroll_jv(key_generate_unroll, env_state, training_state)
-        new_observation_rms = training_state.observation_rms.update(data['obs'])
-        training_state = dataclasses.replace(
-            training_state,
-            observation_rms=new_observation_rms
-        )
+        # YOU ARE HERE JOHN _ FIX NUMBER OF ROLLOUTS GENERATED SO WE PARALLELIZE PROPERLY
+        # data, env_state = generate_unroll_jv(key_generate_unroll, env_state, training_state)
+        # new_obs_rms = training_state.obs_rms.update(data['obs'])
+        # training_state = dataclasses.replace(
+        #     training_state,
+        #     obs_rms=new_obs_rms
+        # )
 
-        (new_training_state, _), metrics = jax.lax.scan(
+        def f(carry, _):
+            env_state, key = carry
+            key, new_key = jr.split(key)
+            data, next_state = generate_unroll_jv(key, env_state, training_state)
+            return (next_state, new_key), data
+
+        (new_env_state, _), data = filter_scan(
+            f, (env_state, key_generate_unroll), (),
+            length=minibatch_size * num_minibatches // num_envs)
+
+        data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
+        data = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), data)
+        # data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
+        
+        (new_training_state, _), metrics = filter_scan(
             partial(
                     sgd_step, data=data),
             (training_state, key_sgd), (),
             length=num_updates_per_batch)
         
-        return (new_training_state, new_key), metrics
+        return (new_training_state, new_env_state, new_key), metrics
     
     def training_epoch(key, training_state, env_state):
-        (new_training_state, new_env_state, _), loss_metrics = jax.lax.scan(
+        (new_training_state, new_env_state, _), loss_metrics = filter_scan(
             training_step, (training_state, env_state, key), (),
             length=num_training_steps_per_epoch)
         loss_metrics = jax.tree_util.tree_map(jnp.mean, loss_metrics)

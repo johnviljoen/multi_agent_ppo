@@ -141,8 +141,8 @@ def compute_ppo_loss(
     # Total loss = policy loss + value loss + entropy loss
     total_loss = policy_loss + v_loss + entropy_loss
 
-    jax.debug.print("v_loss: {v_loss}", v_loss = v_loss)
-    jax.debug.print("total_loss: {total_loss}", total_loss = total_loss)
+    # jax.debug.print("v_loss: {v_loss}", v_loss = v_loss)
+    # jax.debug.print("total_loss: {total_loss}", total_loss = total_loss)
 
     return total_loss, {
         'total_loss': total_loss,

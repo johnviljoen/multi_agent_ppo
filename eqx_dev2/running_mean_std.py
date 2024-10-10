@@ -13,7 +13,7 @@ class RunningMeanStd(eqx.Module):
         arr = jax.lax.stop_gradient(arr)
         batch_mean = jnp.mean(arr, axis=tuple(range(arr.ndim - 1)))
         batch_var = jnp.var(arr, axis=tuple(range(arr.ndim - 1)))
-        batch_count = int(jnp.prod(jnp.array(arr.shape[:-1]))) # arr.shape[0]
+        batch_count = jnp.prod(jnp.array(arr.shape[:-1])) # arr.shape[0] # enforcing int is problematic in jax tracing
         return self.update_from_moments(batch_mean, batch_var, batch_count)
 
     def update_from_moments(self, batch_mean, batch_var, batch_count):
