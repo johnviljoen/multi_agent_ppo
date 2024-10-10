@@ -1,8 +1,9 @@
 import jax
 import jax.numpy as jnp
+import jax.random as jr
 
-from models import PPOStochasticActor, ValueNetwork
-from data_structures import RunningMeanStd, Transition
+from models import PPOStochasticActor, PPOValueNetwork
+from running_mean_std import RunningMeanStd
 # from data_structures import ReplayBuffer
 
 def compute_gae(truncation: jnp.ndarray,
@@ -10,8 +11,8 @@ def compute_gae(truncation: jnp.ndarray,
                 rewards: jnp.ndarray,
                 values: jnp.ndarray,
                 bootstrap_value: jnp.ndarray,
-                lambda_: float = 1.0,
-                discount: float = 0.99):
+                lambda_: float, # = 1.0,
+                discount: float): # = 0.99
     """Calculates the Generalized Advantage Estimation (GAE).
 
     Args:
@@ -70,27 +71,34 @@ def compute_gae(truncation: jnp.ndarray,
 
 def compute_ppo_loss(
         actor_network: PPOStochasticActor, # Policy network (Equinox module)
-        value_network: ValueNetwork,        # Value network (Equinox module)
+        value_network: PPOValueNetwork,        # Value network (Equinox module)
         observation_rms: RunningMeanStd,        # Running mean std parameters
         data,      # Transition data
         rng: jnp.array,
-        entropy_cost: float = 1e-4,
-        discounting: float = 0.99,
-        reward_scaling: float = 1.0,
-        gae_lambda: float = 0.95,
-        clipping_epsilon: float = 0.2,
-        normalize_advantage: bool = True
+        entropy_cost: float, # = 1e-4,
+        discounting: float, # = 0.99,
+        reward_scaling: float, # = 1.0,
+        gae_lambda: float, # = 0.95,
+        clipping_epsilon: float, # = 0.2,
+        normalize_advantage: bool # = True
     ):
 
     # Put the time dimension first.
-    data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
+    # data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
+
+    # Normalize data
+    obs_normalized = observation_rms.normalize(data["obs"])
+    next_obs_normalized = observation_rms.normalize(data["next_obs"])
 
     # Calculate the estimated advantages and values
-    baseline = value_network(data.observation, normalize=observation_rms.normalize)
-    bootstrap_value = value_network(data.next_observation[-1], normalize=observation_rms.normalize)
-    rewards = data.reward * reward_scaling
-    truncation = data.trunctation
-    termination = (1 - data.discount) * (1 - truncation)
+    baseline = jax.vmap(jax.vmap(value_network))(obs_normalized)
+    bootstrap_value = jax.vmap(value_network)(next_obs_normalized[-1])
+    rewards = data["reward"] * reward_scaling
+
+    # data.keys()
+    # dict_keys(['action', 'done', 'log_prob', 'next_obs', 'obs', 'reward', 'value'])
+    truncation = data["truncation"] # CHECK FROM HERE #
+    termination = (1 - data["discount"]) * (1 - truncation)
     vs, advantages = compute_gae(
         truncation=truncation,
         termination=termination,
@@ -106,9 +114,13 @@ def compute_ppo_loss(
 
     # Calculate the Policy Ratio rho_s
     # rho_s = policy(a_t|s_t) / policy_old(a_t|s_t) = exp(log policy(a_t|s_t) - log policy_old(a_t|s_t))
-    policy_logits = actor_network(data.observation, rms=observation_rms)
-    target_action_log_probs = actor_network.log_prob(policy_logits, data.raw_action)
-    behaviour_action_log_probs = data.log_prob
+    _rng, rng = jr.split(rng)
+
+    #### WE ARE HERE JOHN ####
+
+    policy_logits, _ = jax.vmap(jax.vmap(actor_network))(jr.split(_rng, obs_normalized.shape[0:2]), obs_normalized)
+    target_action_log_probs = jax.vmap(jax.vmap(actor_network.log_prob))(policy_logits, data["raw_action"])
+    behaviour_action_log_probs = data["log_prob"]
     rho_s = jnp.exp(target_action_log_probs - behaviour_action_log_probs)
 
     # Surrogate Objective: we use a clipped version of the policy ratio to prevent large updates
@@ -222,8 +234,7 @@ if __name__ == "__main__":
         env_state = jax.vmap(env.reset)(jr.split(_rng, [num_envs]));  _rng, rng = jr.split(rng)
 
         actor_network = PPOStochasticActor(_rng, [env.observation_size, 32, 32, 32, env.action_size]);  _rng, rng = jr.split(rng)
-
-        value_network = ValueNetwork(_rng, [env.observation_size, 32, 32, 32, 1]);  _rng, rng = jr.split(rng)
+        value_network = PPOValueNetwork(_rng, [env.observation_size, 32, 32, 32, 1]);  _rng, rng = jr.split(rng)
 
         data = []
         for i in range(unroll_length):

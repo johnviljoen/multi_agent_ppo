@@ -139,6 +139,46 @@ class DoubleCritic(eqx.Module):
         return v
 
 
+class SACDoubleCritic(eqx.Module):
+    critic_1_layers: list[eqx.nn.Linear]
+    critic_2_layers: list[eqx.nn.Linear]
+    critic_1_bias: list[jax.Array]
+    critic_2_bias: list[jax.Array]
+    activation: callable
+
+    def __init__(self, key, layer_sizes, activation=jax.nn.relu):
+
+        keys = jr.split(key, num=len(layer_sizes)*2) # fully consume the mlp_key
+
+        self.critic_1_layers = [eqx.nn.Linear(in_features, out_features, key=keys[i]) 
+                       for i, (in_features, out_features) in enumerate(zip(layer_sizes[:-1], layer_sizes[1:]))]
+        self.critic_2_layers = [eqx.nn.Linear(in_features, out_features, key=keys[i+len(layer_sizes)]) 
+                       for i, (in_features, out_features) in enumerate(zip(layer_sizes[:-1], layer_sizes[1:]))]
+        
+        self.critic_1_bias = [jnp.zeros(out_features) for out_features in layer_sizes[1:]]
+        self.critic_2_bias = [jnp.zeros(out_features) for out_features in layer_sizes[1:]]
+
+        self.activation = activation
+
+    def __call__(self, x):
+
+        def mlp_forward(v, layers, bias):
+            # pass through critic_1
+            for linear, b in zip(layers[:-1], bias[:-1]):
+                v = linear(v)
+                v += b
+                v = self.activation(v)
+            v = layers[-1](v) + bias[-1] # dont apply act to final output
+            return v
+        
+        v1 = mlp_forward(x, self.critic_1_layers, self.critic_1_bias)
+        v2 = mlp_forward(x, self.critic_2_layers, self.critic_2_bias)
+
+        v = jnp.min(jnp.hstack([v1,v2]))
+
+        return v
+
+
 if __name__ == "__main__":
 
     global_key = jr.PRNGKey(0)

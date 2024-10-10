@@ -1,24 +1,8 @@
 import jax
 import jax.numpy as jnp
-import jax.random as jr
 import equinox as eqx
 import dataclasses
 
-from typing import Any, Mapping, NamedTuple, Tuple, TypeVar
-
-from typing import Dict
-
-
-class Transition(NamedTuple):
-    observation: jnp.array
-    action: jnp.array
-    reward: jnp.array
-    discount: jnp.array
-    next_observation: jnp.array
-    extras: Dict
-
-
-# equinox modules cast the dataclass to a pytree - we can use dataclasses.replace on it
 class RunningMeanStd(eqx.Module):
     mean: jnp.ndarray
     var: jnp.ndarray
@@ -27,9 +11,9 @@ class RunningMeanStd(eqx.Module):
 
     def update(self, arr) -> None:
         arr = jax.lax.stop_gradient(arr)
-        batch_mean = jnp.mean(arr, axis=0)
-        batch_var = jnp.var(arr, axis=0)
-        batch_count = arr.shape[0]
+        batch_mean = jnp.mean(arr, axis=tuple(range(arr.ndim - 1)))
+        batch_var = jnp.var(arr, axis=tuple(range(arr.ndim - 1)))
+        batch_count = int(jnp.prod(jnp.array(arr.shape[:-1]))) # arr.shape[0]
         return self.update_from_moments(batch_mean, batch_var, batch_count)
 
     def update_from_moments(self, batch_mean, batch_var, batch_count):
