@@ -78,15 +78,10 @@ if __name__ == "__main__":
     value = PPOValueNetwork(critic_key, [num_actions,10,10,1])
 
     x = jr.normal(dataset_key, shape=[batch_size,2])
-    normalize_fn = lambda x: x
 
-    actor_call = partial(actor, normalize_fn=normalize_fn)
-    actor_log_prob = partial(actor.log_prob, normalize_fn=normalize_fn)
-    actor_entropy = partial(actor.entropy, normalize_fn=normalize_fn)
-
-    actor_call_jv = jit(vmap(actor_call))
-    actor_log_prob_jv = jit(vmap(actor_log_prob))
-    actor_entropy_jv = jit(vmap(actor_entropy))
+    actor_call_jv = jit(vmap(actor.__call__))
+    actor_log_prob_jv = jit(vmap(actor.log_prob))
+    actor_entropy_jv = jit(vmap(actor.entropy))
 
     u = actor_call_jv(jr.split(sample_key, num=batch_size), x)
     lp = actor_log_prob_jv(x, u)

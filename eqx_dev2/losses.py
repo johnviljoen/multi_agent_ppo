@@ -59,7 +59,7 @@ def compute_gae(truncation: jnp.ndarray,
         (truncation_mask, deltas, termination),
         length=int(truncation_mask.shape[0]),
         reverse=True)
-    
+
     # Final Values and Advantages
     # advantage = (rewards + gamma * (1-termination) * V(s_{t+1})) - V(s_t)
     # Add V(x_s) to get v_s.
@@ -94,10 +94,7 @@ def compute_ppo_loss(
     baseline = jax.vmap(jax.vmap(value_network))(obs_normalized)
     bootstrap_value = jax.vmap(value_network)(next_obs_normalized[-1])
     rewards = data["reward"] * reward_scaling
-
-    # data.keys()
-    # dict_keys(['action', 'done', 'log_prob', 'next_obs', 'obs', 'reward', 'value'])
-    truncation = data["truncation"] # CHECK FROM HERE #
+    truncation = data["truncation"]
     termination = (1 - data["discount"]) * (1 - truncation)
     vs, advantages = compute_gae(
         truncation=truncation,
@@ -114,12 +111,9 @@ def compute_ppo_loss(
 
     # Calculate the Policy Ratio rho_s
     # rho_s = policy(a_t|s_t) / policy_old(a_t|s_t) = exp(log policy(a_t|s_t) - log policy_old(a_t|s_t))
-    _rng, rng = jr.split(rng)
-
-    #### WE ARE HERE JOHN ####
-
-    policy_logits, _ = jax.vmap(jax.vmap(actor_network))(jr.split(_rng, obs_normalized.shape[0:2]), obs_normalized)
-    target_action_log_probs = jax.vmap(jax.vmap(actor_network.log_prob))(policy_logits, data["raw_action"])
+    # Compute the log probabilities under the current policy
+    # Use deterministic outputs (mean) from the policy network
+    target_action_log_probs = jax.vmap(jax.vmap(actor_network.log_prob))(obs_normalized, data['action'])
     behaviour_action_log_probs = data["log_prob"]
     rho_s = jnp.exp(target_action_log_probs - behaviour_action_log_probs)
 
@@ -141,11 +135,15 @@ def compute_ppo_loss(
 
     # Entropy reward
     # entropy = - Sum_a policy(a|s) log policy(a|s) * entropy_cost
-    entropy = jnp.mean(actor_network.entropy(policy_logits, rng))
+    entropy = jnp.mean(jax.vmap(jax.vmap(actor_network.entropy))(jr.split(rng, obs_normalized.shape[0:2]), obs_normalized))
     entropy_loss = entropy_cost * -entropy
 
     # Total loss = policy loss + value loss + entropy loss
     total_loss = policy_loss + v_loss + entropy_loss
+
+    jax.debug.print("v_loss: {v_loss}", v_loss = v_loss)
+    jax.debug.print("total_loss: {total_loss}", total_loss = total_loss)
+
     return total_loss, {
         'total_loss': total_loss,
         'policy_loss': policy_loss,
@@ -224,48 +222,102 @@ if __name__ == "__main__":
 
     def unit_test_ppo_loss(seed):
 
-        rng = jr.PRNGKey(seed); _rng, rng = jr.split(rng)
-    
-        # need some arbitrary data
-        num_envs = 3
-        unroll_length = 5
+        import dataclasses
+        import optax
+        import equinox as eqx
 
-        env = envs.get_environment(env_name="reacher", backend="positional")
-        env_state = jax.vmap(env.reset)(jr.split(_rng, [num_envs]));  _rng, rng = jr.split(rng)
+        from train import AgentModel, TrainingState
+        from brax import envs
+        # from brax_example.losses import compute_ppo_loss as compute_ppo_loss_example
 
-        actor_network = PPOStochasticActor(_rng, [env.observation_size, 32, 32, 32, env.action_size]);  _rng, rng = jr.split(rng)
-        value_network = PPOValueNetwork(_rng, [env.observation_size, 32, 32, 32, 1]);  _rng, rng = jr.split(rng)
+        env = envs.get_environment('ant', backend='positional')
 
-        data = []
-        for i in range(unroll_length):
+        num_timesteps=50_000_000
+        episode_length=1000
+        num_envs=int(4096*1)
+        learning_rate=3e-4
+        entropy_cost=1e-2
+        discounting=0.97
+        seed=1
+        unroll_length=5
+        batch_size=2048
+        num_minibatches=32
+        num_updates_per_batch=4
+        reward_scaling=10.
+        clipping_epsilon=0.2
+        gae_lambda=0.95
+        normalize_advantage=True
 
-            action, raw_action = jax.vmap(actor_network)(jr.split(_rng, num=num_envs), env_state.obs); _rng, rng = jr.split(rng)
-            nstate = jax.vmap(env.step)(env_state, action)
+        key = jr.PRNGKey(seed)
+        _key, key = jr.split(key)
 
-            data.append(
-                Transition(
-                    observation=env_state.obs,
-                    action=action,
-                    reward=nstate.reward,
-                    discount=1 - nstate.done,
-                    next_observation=nstate.obs,
-                    extras = {
-                        'policy_extras': {'raw_action': raw_action},
-                        'state_extras': {}
-                    }
-                )
+        env_v = envs.training.wrap(env, episode_length=episode_length)
+        actor_network = PPOStochasticActor(_key, layer_sizes=[env.observation_size, 64, 64, env.action_size]); _key, key = jr.split(key)
+        value_network = PPOValueNetwork(_key, layer_sizes=[env.observation_size, 64, 64, 1]); _key, key = jr.split(key)
+        model = AgentModel(actor_network=actor_network, value_network=value_network)
+        opt = optax.adam(learning_rate)
+        opt_state = opt.init(eqx.filter(model, eqx.is_inexact_array))
+        obs_rms = RunningMeanStd(mean=jnp.zeros(env.observation_size), var=jnp.ones(env.observation_size), count=1e-4)
+        training_state = TrainingState(opt_state, model, obs_rms, env_steps=0)
+
+        def generate_rollout_v(key, env_state, training_state, env_v=env_v, unroll_length=unroll_length):
+            
+            def step_fn(carry, _):
+                state, key = carry
+                obs = state.obs  
+                _key, key = jr.split(key)
+                obs_normalized = training_state.observation_rms.normalize(obs)
+                action, raw_action = jax.vmap(training_state.model.actor_network)(jr.split(_key, batch_size), obs_normalized)
+                next_state = env_v.step(state, action)
+                log_prob = jax.vmap(training_state.model.actor_network.log_prob)(obs_normalized, action)
+                value = jax.vmap(training_state.model.value_network)(obs_normalized)
+                data = {
+                    'obs': obs,
+                    'action': action,
+                    'reward': next_state.reward,
+                    'discount': 1 - next_state.done, # how we decide if truncation is terminal or not
+                    'truncation': next_state.info['truncation'],
+                    'log_prob': log_prob,
+                    'value': value,
+                    'next_obs': next_state.obs,
+                    'raw_action': raw_action, # action without gaussian applied to it
+                }
+                return (next_state, key), data
+
+            (final_state, _), data_seq = jax.lax.scan(
+                step_fn, (env_state, key), None, length=unroll_length
             )
 
+            return data_seq, final_state
 
-        def f(carry, unused_t):
+        env_reset_jv = jax.jit(env_v.reset)
+        generate_unroll_jv = eqx.filter_jit(generate_rollout_v)
+        total_steps = 0
+        env_state = env_reset_jv(jr.split(_key, num=batch_size)); _key, key = jr.split(key)
 
-            observation = jax.vmap(env._get_obs)(env_state.pipeline_state) # a single snapshot across all environments
-            action = jax.vmap(actor_network)(observation)
-            env_state = jax.vmap(env.step)(env_state, action)
-            reward = env_state.reward
-            next_observation = jax.vmap(env._get_obs)(env_state.pipeline_state)
+        # single unroll to test ppo_loss
+        data, env_state = generate_unroll_jv(_key, env_state, training_state); _key, key = jr.split(key)
+        new_observation_rms = training_state.observation_rms.update(data['obs'])
+        training_state = dataclasses.replace(training_state, observation_rms=new_observation_rms)
+        
+        # compute ppo loss via my method and via the known to be correct method
+        loss, all_losses = compute_ppo_loss(
+            actor_network=model.actor_network,
+            value_network=model.value_network,
+            observation_rms=training_state.observation_rms,
+            data=data,
+            rng=key,
+            entropy_cost=entropy_cost,
+            discounting=discounting,
+            reward_scaling=reward_scaling,
+            gae_lambda=gae_lambda,
+            clipping_epsilon=clipping_epsilon,
+            normalize_advantage=normalize_advantage
+        )
 
-            actor_network()
+        # loss_example = compute_ppo_loss_example(
+
+        # )
 
         print('fin')
 

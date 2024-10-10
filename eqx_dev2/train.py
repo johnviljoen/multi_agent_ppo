@@ -1,16 +1,18 @@
+import functools
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-import numpy as np
 import optax
 import equinox as eqx
 import dataclasses
 
 from brax import envs
 
+# my code
 from models import PPOStochasticActor, PPOValueNetwork
 from running_mean_std import RunningMeanStd
 from losses import compute_ppo_loss
+from plotting import rollout_and_render
 
 # Define your AgentModel to hold both the actor and critic networks
 class AgentModel(eqx.Module):
@@ -49,7 +51,7 @@ def train(
     act_size = env.action_size
 
     # this provides truncation information, vmaps the env, and auto resets finished envs
-    env = envs.training.wrap(
+    env_v = envs.training.wrap(
         env,
         episode_length=episode_length,
         action_repeat=1,
@@ -106,7 +108,7 @@ def train(
             )
             return total_loss
 
-        grads = eqx.filter_grad(loss_fn)(training_state.model)
+        loss, grads = eqx.filter_value_and_grad(loss_fn)(training_state.model)
         updates, new_optimizer_state = optimizer.update(
             grads, training_state.optimizer_state, training_state.model
         )
@@ -118,9 +120,9 @@ def train(
             env_steps=training_state.env_steps + unroll_length * num_envs
         )
 
-        return new_training_state
+        return new_training_state, loss
 
-    def generate_unroll(key, env_state, training_state, env=env, unroll_length=unroll_length, batch_size=batch_size):
+    def generate_unroll_v(key, env_state, training_state, env_v=env_v, unroll_length=unroll_length, batch_size=batch_size):
 
         def step_fn(carry, _):
             state, key = carry
@@ -131,7 +133,7 @@ def train(
             # Get action from policy
             action, raw_action = jax.vmap(training_state.model.actor_network)(jr.split(_key, batch_size), obs_normalized)
             # Step environment
-            next_state = env.step(state, action)
+            next_state = env_v.step(state, action)
             # Compute log_prob and value
             log_prob = jax.vmap(training_state.model.actor_network.log_prob)(obs_normalized, action)
             value = jax.vmap(training_state.model.value_network)(obs_normalized)
@@ -145,7 +147,8 @@ def train(
                 'log_prob': log_prob,
                 'value': value,
                 'next_obs': next_state.obs,  # Assuming next_state has 'observation'
-                'raw_action': raw_action # action without gaussian applied to it
+                'raw_action': raw_action, # action without gaussian applied to it
+                # 'pipeline_state': state.pipeline_state # optional - just for plotting
             }
             return (next_state, key), data
 
@@ -160,17 +163,20 @@ def train(
     
     # Initialize environment state
     _key, key = jr.split(key)
-    # env_state = jax.vmap(env.reset)(_key); _key, key = jr.split(key)
+    # env_state = jax.vmap(env_v.reset)(_key); _key, key = jr.split(key)
 
-    env_reset_jv = jax.jit(env.reset)
-    generate_unroll_jv = eqx.filter_jit(generate_unroll)# , in_axes=[0,0,None]))
+    env_reset_jv = jax.jit(env_v.reset)
+    generate_unroll_jv = eqx.filter_jit(generate_unroll_v)# , in_axes=[0,0,None]))
 
     total_steps = 0
 
+    env_state = env_reset_jv(jr.split(_key, num=batch_size)); _key, key = jr.split(key)
+
     while total_steps < num_timesteps:
 
+        print(total_steps)
+
         # Generate data
-        env_state = env_reset_jv(jr.split(_key, num=batch_size)); _key, key = jr.split(key)
         data, env_state = generate_unroll_jv(_key, env_state, training_state); _key, key = jr.split(key)
 
         # Update observation_rms
@@ -180,8 +186,12 @@ def train(
             observation_rms=new_observation_rms
         )
 
+        # rollout_and_render(env, actor_network, observation_rms)
+
         # Update model parameters
-        training_state = update_step(key, training_state, data, optimizer)
+        training_state, loss = update_step(key, training_state, data, optimizer)
+
+        print(loss)
 
         total_steps += unroll_length * num_envs
 
@@ -194,15 +204,14 @@ if __name__ == "__main__":
     env_name = 'ant'  # @param ['ant', 'halfcheetah', 'hopper', 'humanoid', 'humanoidstandup', 'inverted_pendulum', 'inverted_double_pendulum', 'pusher', 'reacher', 'walker2d']
     backend = 'positional'  # @param ['generalized', 'positional', 'spring']
 
-    env = envs.get_environment(env_name=env_name,
-                            backend=backend)
+    env = envs.get_environment(env_name=env_name, backend=backend)
 
     # known to work parameters for ant
     training_state = train(
         env=env,
         num_timesteps=50_000_000,
         episode_length=1000,
-        num_envs=4096,
+        num_envs=int(4096*1),
         learning_rate=3e-4,
         entropy_cost=1e-2,
         discounting=0.97,
