@@ -14,7 +14,7 @@ class PPOStochasticActor(eqx.Module):
     layer_sizes: List[int]
     action_distribution: dataclass = eqx.field(static=True)
 
-    def __init__(self, key, layer_sizes, activation=jax.nn.relu, action_distribution=distributions.NormalTanhDistribution()):
+    def __init__(self, key, layer_sizes, activation=jax.nn.silu, action_distribution=distributions.NormalTanhDistribution()):
         keys = jr.split(key, num=len(layer_sizes))
         self.layers = [
             eqx.nn.Linear(in_features, out_features, key=keys[i])
@@ -26,28 +26,40 @@ class PPOStochasticActor(eqx.Module):
         self.action_distribution = action_distribution
 
     def __call__(self, key, x):
-        mean = self.forward_deterministic(x)
-        action = self.action_distribution.sample(key, mean, self.std)
+        for linear in self.layers[:-1]:
+            x = self.activation(linear(x))
+        x = self.layers[-1](x)
+        mean, std = jnp.split(x, 2, axis=-1)
+        action = self.action_distribution.sample(key, mean, std)
         return action, mean
     
     def forward_deterministic(self, x):
         for linear in self.layers[:-1]:
             x = self.activation(linear(x))
-        mean = self.layers[-1](x)  # Output mean
+        x = self.layers[-1](x)
+        mean, std = jnp.split(x, 2, axis=-1)
         return mean
 
     def log_prob(self, x, action):
-        return self.action_distribution.log_prob(loc=self.forward_deterministic(x), scale=self.std, actions=action)
+        for linear in self.layers[:-1]:
+            x = self.activation(linear(x))
+        x = self.layers[-1](x)
+        mean, std = jnp.split(x, 2, axis=-1)
+        return self.action_distribution.log_prob(loc=mean, scale=std, actions=action)
 
     def entropy(self, key, x):
-        return self.action_distribution.entropy(key=key, loc=self.forward_deterministic(x), scale=self.std)
+        for linear in self.layers[:-1]:
+            x = self.activation(linear(x))
+        x = self.layers[-1](x)
+        mean, std = jnp.split(x, 2, axis=-1)
+        return self.action_distribution.entropy(key=key, loc=mean, scale=std)
     
 
 class PPOValueNetwork(eqx.Module):
     layers: List[eqx.nn.Linear]
     activation: Callable
 
-    def __init__(self, key, layer_sizes, activation=jax.nn.relu):
+    def __init__(self, key, layer_sizes, activation=jax.nn.silu):
         keys = jr.split(key, num=len(layer_sizes) - 1)
         self.layers = [
             eqx.nn.Linear(in_f, out_f, key=k)

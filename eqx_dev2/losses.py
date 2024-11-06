@@ -148,7 +148,9 @@ def compute_ppo_loss(
         'total_loss': total_loss,
         'policy_loss': policy_loss,
         'v_loss': v_loss,
-        'entropy_loss': entropy_loss
+        'entropy_loss': entropy_loss,
+        'entropy': entropy,
+        'log_prob': behaviour_action_log_probs,
     }
 
 if __name__ == "__main__": 
