@@ -12,6 +12,7 @@ def generate_rollout_v(key, env_state, training_state, env_v, unroll_length):
         _key, key = jr.split(key)
         obs_normalized = training_state.obs_rms.normalize(obs)
         action, raw_action = jax.vmap(training_state.model.actor_network)(jr.split(_key, batch_size), obs_normalized)
+        next_state = env_v.step(state, action)
         log_prob = jax.vmap(training_state.model.actor_network.log_prob)(obs_normalized, action)
         value = jax.vmap(training_state.model.value_network)(obs_normalized)
         data = {
