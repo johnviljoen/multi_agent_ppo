@@ -135,11 +135,6 @@ def train(
 
         # YOU ARE HERE JOHN _ FIX NUMBER OF ROLLOUTS GENERATED SO WE PARALLELIZE PROPERLY
         # data, env_state = generate_unroll_jv(key_generate_unroll, env_state, training_state)
-        # new_obs_rms = training_state.obs_rms.update(data['obs'])
-        # training_state = dataclasses.replace(
-        #     training_state,
-        #     obs_rms=new_obs_rms
-        # )
 
         def f(carry, _):
             env_state, key = carry
@@ -154,6 +149,12 @@ def train(
         data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
         data = jax.tree_util.tree_map(lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), data)
         
+        # new_obs_rms = training_state.obs_rms.update(data['obs'])
+        # # training_state = dataclasses.replace(
+        # #     training_state,
+        # #     obs_rms=new_obs_rms
+        # # )
+        
         (new_training_state, _), metrics = filter_scan(
             partial(
                     sgd_step, data=data),
@@ -161,7 +162,8 @@ def train(
             length=num_updates_per_batch)
         new_training_state = dataclasses.replace(
             new_training_state,
-            env_steps=new_training_state.env_steps + env_step_per_training_step
+            env_steps=new_training_state.env_steps + env_step_per_training_step,
+            # obs_rms=new_obs_rms
         )
         return (new_training_state, new_env_state, new_key), metrics
     
@@ -210,8 +212,8 @@ if __name__ == "__main__":
         env=env,
         num_timesteps=50_000_000,
         episode_length=1000,
-        num_envs=int(4096*1),
-        learning_rate=3e-4,
+        num_envs=int(8192*1),
+        learning_rate=1e-4,
         entropy_cost=1e-2,
         discounting=0.97,
         seed=1,
@@ -219,7 +221,7 @@ if __name__ == "__main__":
         minibatch_size=2048,
         num_minibatches=32,
         num_updates_per_batch=4,
-        reward_scaling=10.,
+        reward_scaling=4.,
         clipping_epsilon=0.2,
         gae_lambda=0.95,
         normalize_advantage=True,

@@ -39,7 +39,7 @@ def compute_gae(truncation: jnp.ndarray,
     # TD residuals:
     # delta_t = r_t + gamma * (1-d_t) * V(s_{t+1}) - V(s_t)
     # Append bootstrapped value to get [v1, ..., v_t+1]
-    values_t_plus_1 = jnp.concatenate([values[1:], jnp.expand_dims(bootstrap_value, 0)], axis=0)
+    values_t_plus_1 = jnp.concatenate([values[:, 1:], jnp.expand_dims(bootstrap_value, 1)], axis=1)
     deltas = rewards + discount * (1 - termination) * values_t_plus_1 - values
     deltas *= truncation_mask
 
@@ -56,15 +56,15 @@ def compute_gae(truncation: jnp.ndarray,
         return (lambda_, acc), (acc)
     (_, _), (vs_minus_v_xs) = jax.lax.scan(
         compute_vs_minus_v_xs, (lambda_, acc),
-        (truncation_mask, deltas, termination),
-        length=int(truncation_mask.shape[0]),
+        (truncation_mask.transpose(), deltas.transpose(), termination.transpose()),
+        length=int(truncation_mask.shape[1]),
         reverse=True)
 
     # Final Values and Advantages
     # advantage = (rewards + gamma * (1-termination) * V(s_{t+1})) - V(s_t)
     # Add V(x_s) to get v_s.
-    vs = jnp.add(vs_minus_v_xs, values)
-    vs_t_plus_1 = jnp.concatenate([vs[1:], jnp.expand_dims(bootstrap_value, 0)], axis=0)
+    vs = jnp.add(vs_minus_v_xs.transpose(), values)
+    vs_t_plus_1 = jnp.concatenate([vs[:, 1:], jnp.expand_dims(bootstrap_value, 1)], axis=1)
     advantages = (rewards + discount * (1 - termination) * vs_t_plus_1 - values) * truncation_mask
     return jax.lax.stop_gradient(vs), jax.lax.stop_gradient(advantages)
 
@@ -92,7 +92,7 @@ def compute_ppo_loss(
 
     # Calculate the estimated advantages and values
     baseline = jax.vmap(jax.vmap(value_network))(obs_normalized)
-    bootstrap_value = jax.vmap(value_network)(next_obs_normalized[-1])
+    bootstrap_value = jax.vmap(value_network)(next_obs_normalized[:, -1])
     rewards = data["reward"] * reward_scaling
     truncation = data["truncation"]
     termination = (1 - data["discount"]) * (1 - truncation)
